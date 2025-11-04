@@ -1,0 +1,77 @@
+FROM repo.irsl.eiiris.tut.ac.jp/irsl_system:one
+
+WORKDIR /RoboManip
+
+# 0. ROS系リポジトリ無効化（署名エラー回避）
+RUN sed -i 's@^deb .*ros.packages.techfak.net.*@# disabled ros repo@g' /etc/apt/sources.list.d/* || true && \
+    sed -i 's@^deb .*ros.packages.techfak.net.*@# disabled ros repo@g' /etc/apt/sources.list || true
+
+# 1. 依存パッケージ＋ffmpeg系もここで全部入れる
+#    → 最後にapt入れると署名/GPG問題出たり /var/cache/apt/archives の空きが足りなかったりするので
+#       ここでまとめて入れる方式にした
+RUN apt-get update && \
+    apt-get autoremove -y && \
+    apt-get clean && \
+    apt-get install -y --no-install-recommends \
+        wget curl ca-certificates gnupg \
+        build-essential \
+        libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
+        libffi-dev liblzma-dev tk-dev libncursesw5-dev uuid-dev \
+        git \
+        ffmpeg \
+        libglib2.0-0 libsm6 libxrender1 libxext6 libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Python3.10をソースからビルド（共有ライブラリあり・rpath埋め込み）
+RUN cd /tmp && \
+    wget https://www.python.org/ftp/python/3.10.14/Python-3.10.14.tgz && \
+    tar xzf Python-3.10.14.tgz && \
+    cd Python-3.10.14 && \
+    LDFLAGS="-Wl,-rpath,/opt/python3.10/lib" \
+    ./configure \
+        --prefix=/opt/python3.10 \
+        --enable-optimizations \
+        --with-ensurepip=install \
+        --enable-shared && \
+    make -j"$(nproc)" && \
+    make install && \
+    cd / && rm -rf /tmp/Python-3.10.14 /tmp/Python-3.10.14.tgz
+
+# 2.5 ランタイムが libpython3.10.so.1.0 を見つけられるようにしとく（保険）
+ENV LD_LIBRARY_PATH="/opt/python3.10/lib:${LD_LIBRARY_PATH}"
+
+# 3. venv-rmb を Python3.10 で作る
+RUN /opt/python3.10/bin/python3.10 -m venv /RoboManip/venv-rmb && \
+    /RoboManip/venv-rmb/bin/pip install --upgrade pip setuptools wheel
+
+# 4. クリーンな RoboManipBaselines を clone
+RUN git clone https://github.com/isri-aist/RoboManipBaselines.git --recursive /RoboManip/RoboManipBaselines
+
+# 5. torch / torchvision / numpy をホストと揃える
+RUN /RoboManip/venv-rmb/bin/pip install \
+        torch==2.4.1+cu118 \
+        torchvision==0.19.1+cu118 \
+        --index-url https://download.pytorch.org/whl/cu118 && \
+    /RoboManip/venv-rmb/bin/pip install \
+        numpy==1.26.4
+
+# 6. torchcodec をホストからコピーして配置
+#    あなたが作った tar を同じディレクトリに置いておくこと
+COPY torchcodec_host.tar.gz /tmp/torchcodec_host.tar.gz
+RUN tar xzf /tmp/torchcodec_host.tar.gz -C /RoboManip/venv-rmb/lib/python3.10/site-packages && \
+    rm /tmp/torchcodec_host.tar.gz
+
+# 7. RoboManipBaselines の依存 (Act) を入れる
+RUN /bin/bash -c "\
+    source /RoboManip/venv-rmb/bin/activate && \
+    cd /RoboManip/RoboManipBaselines && \
+    pip install -e .[act] && \
+    cd third_party/act/detr && \
+    pip install -e . \
+"
+
+# 8. PYTHONPATHをセット（detrの util.misc のため）
+ENV PYTHONPATH="/RoboManip/RoboManipBaselines/third_party/act:/RoboManip/RoboManipBaselines/third_party/act/detr:${PYTHONPATH}"
+
+WORKDIR /RoboManip/RoboManipBaselines
+CMD ["/bin/bash"]
